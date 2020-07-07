@@ -39,6 +39,7 @@ parser.add_argument('-w', '--writedb', help='Write the SQLite database info to d
 parser.add_argument('-s', '--sanitize', help='Sanitize the report by partially redacting passwords and hashes. Prepends the report directory with \"Sanitized - \"',
                     default=False, required=False, action='store_true')
 parser.add_argument('-g', '--grouplists', help='The name of one or multiple files that contain lists of usernames in particular groups. The group names will be taken from the file name itself. The username list must be in the same format as found in the NTDS file such as some.ad.domain.com\\username or it can be in the format output by using the PowerView Get-NetGroupMember function. Example: -g "Domain Admins.txt" "Enterprise Admins.txt"', nargs='*', required=False)
+parser.add_argument('-gd', '--groupdirectory', help='The path to the directory containing grouplist files', required=False)
 parser.add_argument('-m', '--machineaccts', help='Include machine accounts when calculating statistics',
                     default=False, required=False, action='store_true')
 args = parser.parse_args()
@@ -49,6 +50,8 @@ filename_for_html_report = args.outputfile
 folder_for_html_report = args.reportdirectory
 if args.sanitize:
     folder_for_html_report = folder_for_html_report + " - Sanitized"
+if args.groupdirectory is not None:
+    args.grouplist = [f for f in os.listdir(args.groupdirectory) if os.path.isfile(os.path.join(args.groupdirectory,f))]
 if args.grouplists is not None:
     for groupfile in args.grouplists:
         compare_groups.append(
