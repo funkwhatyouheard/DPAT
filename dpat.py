@@ -51,7 +51,7 @@ folder_for_html_report = args.reportdirectory
 if args.sanitize:
     folder_for_html_report = folder_for_html_report + " - Sanitized"
 if args.groupdirectory is not None:
-    args.grouplist = [f for f in os.listdir(args.groupdirectory) if os.path.isfile(os.path.join(args.groupdirectory,f))]
+    args.grouplists = [f for f in os.listdir(args.groupdirectory) if os.path.isfile(os.path.join(args.groupdirectory,f))]
 if args.grouplists is not None:
     for groupfile in args.grouplists:
         compare_groups.append(
