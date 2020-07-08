@@ -203,14 +203,14 @@ if not speed_it_up:
                 fing = open(group[1])
                 users = []
                 for line in fing:
-                    users.append(line.rstrip("\n"))
+                    users.append(line.rstrip("\r\n"))
                 fing.close()
         groups_users[group[0]] = users
 
     # Read in NTDS file
     fin = open(ntds_file)
     for line in fin:
-        vals = line.rstrip("\n").split(':')
+        vals = line.rstrip("\r\n").split(':')
         if len(vals) == 1:
             continue
         usernameFull = vals[0]
@@ -519,7 +519,7 @@ except NameError:
 print('Would you like to open the report now? [Y/n]')
 while True:
     try:
-        response = input().lower().rstrip('\r')
+        response = input().lower().rstrip('\r\n')
         if ((response is "") or (strtobool(response))):
             webbrowser.open(os.path.join("file://" + os.getcwd(),
                                          folder_for_html_report, filename_for_html_report))
