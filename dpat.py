@@ -49,7 +49,7 @@ cracked_file = args.crackfile
 filename_for_html_report = args.outputfile
 folder_for_html_report = args.reportdirectory
 if args.sanitize:
-    folder_for_html_report = folder_for_html_report + " - Sanitized"
+    folder_for_html_report = folder_for_html_report + "_Sanitized"
 if args.groupdirectory is not None:
     args.grouplists = [os.path.join(args.groupdirectory,f) for f in os.listdir(args.groupdirectory) if os.path.isfile(os.path.join(args.groupdirectory,f))]
 if args.grouplists is not None:
