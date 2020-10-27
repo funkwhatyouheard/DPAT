@@ -294,7 +294,7 @@ if not speed_it_up:
                     else:
                         with open(group[1],"r",encoding="UTF-8") as fing:
                             for line in fing:
-                                users.append({"UserPrincipalName":line.rstrip("\r\n"))
+                                users.append({"UserPrincipalName":line.rstrip("\r\n")})
             groups_users[group[0]] = users
 
     # Read in NTDS file
