@@ -7,6 +7,15 @@ import re
 import argparse
 import sqlite3
 import sys
+import json
+import csv
+import tzlocal
+from datetime import datetime
+from importlib.metadata import version
+import pyad 
+from pyad import adquery, adgroup, aduser, pyadutils
+from win32com import client
+from pywintypes import TimeType
 from shutil import copyfile
 try:
     import html as htmllib
@@ -19,6 +28,7 @@ from pprint import pprint
 filename_for_html_report = "_DomainPasswordAuditReport.html"
 folder_for_html_report = "DPAT Report"
 filename_for_db_on_disk = "pass_audit.db"
+ad_properties = ['SamAccountName','UserPrincipalName','Enabled','PwdLastSet','PasswordExpired','PasswordNeverExpires','whenCreated','whenChanged']
 compare_groups = []
 
 # This should be False as it is only a shortcut used during development
@@ -38,8 +48,12 @@ parser.add_argument('-w', '--writedb', help='Write the SQLite database info to d
                     filename_for_db_on_disk + '"', default=False, required=False, action='store_true')
 parser.add_argument('-s', '--sanitize', help='Sanitize the report by partially redacting passwords and hashes. Prepends the report directory with \"Sanitized - \"',
                     default=False, required=False, action='store_true')
-parser.add_argument('-g', '--grouplists', help='The name of one or multiple files that contain lists of usernames in particular groups. The group names will be taken from the file name itself. The username list must be in the same format as found in the NTDS file such as some.ad.domain.com\\username or it can be in the format output by using the PowerView Get-NetGroupMember function. Example: -g "Domain Admins.txt" "Enterprise Admins.txt"', nargs='*', required=False)
+parser.add_argument('-g', '--grouplists', help='The name of one or multiple files that contain lists of usernames in particular groups. \
+                    The group names will be taken from the file name itself. The username list must be in the same format as found in the NTDS file such as some.ad.domain.com\\username \
+                    or it can be in the format output by using the PowerView Get-NetGroupMember function. Example: -g "Domain Admins.txt" "Enterprise Admins.txt"', nargs='*', required=False)
 parser.add_argument('-gd', '--groupdirectory', help='The path to the directory containing grouplist files', required=False)
+parser.add_argument('-ad', '--pullFromAD', default=False, required=False, action='store_true', help='Pull the groups specified by grouplists directly from AD w/extended properties. Requires baseDN param.'),
+parser.add_argument('-dn', '--baseDN', default=None, required=False, help='The base DN to search for groups/users if pullFromAD is "true"'),
 parser.add_argument('-m', '--machineaccts', help='Include machine accounts when calculating statistics',
                     default=False, required=False, action='store_true')
 args = parser.parse_args()
@@ -116,10 +130,9 @@ class HtmlBuilder:
         self.build_html_body_string(html)
 
     def write_html_report(self, filename):
-        f = open(os.path.join(folder_for_html_report, filename), "w")
-        copyfile('report.css', os.path.join(folder_for_html_report, "report.css"))
-        f.write(self.get_html())
-        f.close()
+        with open(os.path.join(folder_for_html_report, filename), "w") as f:
+            copyfile('report.css', os.path.join(folder_for_html_report, "report.css"))
+            f.write(self.get_html())
         return filename
 
 
@@ -154,7 +167,6 @@ def all_casings(input_string):
                 yield first.lower() + sub_casing
                 yield first.upper() + sub_casing
 
-
 def crack_it(nt_hash, lm_pass):
     password = None
     for pwd_guess in all_casings(lm_pass):
@@ -164,11 +176,77 @@ def crack_it(nt_hash, lm_pass):
             break
     return password
 
+def pull_ad_info(base_dn,group_cns=None,properties=None):
+    group_info = dict()
+    tz = tzlocal.get_localzone()
+    if not isinstance(properties,list):
+        properties = [properties]
+    if 'UserPrincipalName' not in properties:
+        properties.append('UserPrincipalName')
+    if not isinstance(group_cns,list):
+        group_cns = [group_cns]
+    # if no groups specified, get all groups
+    if len(group_cns) < 1 and group_cns[0] is None:
+        # check pyad version is .5.15 or can'd use ldap_dialect param
+        # https://docs.microsoft.com/en-us/windows/win32/adsi/search-filter-syntax
+        # below will get only security groups... 
+        print("Attempting to retrieve all groups...")
+        q = adquery.ADQuery()
+        if version('pyad') == '0.5.15':
+            q.execute_query(attributes=['CN'],
+                where_clause="(&(objectCategory=group)(groupType:1.2.840.113556.1.4.803:=2147483648))",
+                base_dn=base_dn,ldap_dialect=True)
+        else:
+            q.execute_query(attributes=['CN'],
+                where_clause="objectClass='group'",
+                base_dn=base_dn)
+        group_cns = [g['CN'] for g in q.get_all_results()]
+    print("Found {0} groups".format(len(group_cns)))
+    for cn in group_cns:
+        # get group members and their properties
+        print("Processing {0}".format(cn))
+        entities = list()
+        members = list()
+        group = adgroup.ADGroup.from_cn(cn)
+        members = group.get_members(recursive=True,ignoreGroups=True)
+        # if there are members, get the desired attributes
+        if len(members) >= 1:
+            for member in members:
+                # Foreign SIDS will cause problems
+                if member._type == 'foreign-security-principal':
+                    print("Skipping foreign SID\n{0}".format(member.adsPath))
+                    continue
+                entity = dict()
+                for prop in properties:
+                    # have to pull these out of UAC settings
+                    if prop == "Enabled":
+                        attr = not member.get_user_account_control_settings()['ACCOUNTDISABLE']
+                    elif prop == "PasswordExpired":
+                        attr = member.get_user_account_control_settings()['PASSWORD_EXPIRED']
+                    elif prop == "PasswordNeverExpires":
+                        attr = member.get_user_account_control_settings()['DONT_EXPIRE_PASSWD']
+                    else:
+                        attr = member.get_attribute(prop)
+                    attr = attr[0] if isinstance(attr,list) and len(attr) >= 1 else attr
+                    if isinstance(attr,TimeType):
+                        # these will be in UTC
+                        attr = attr.isoformat()
+                    if isinstance(attr,client.CDispatch):
+                        # convert localtime to UTC
+                        # these will be in local time
+                        dt = pyadutils.convert_datetime(attr)
+                        tz_aware = dt.replace(tzinfo=tz)
+                        attr = datetime.utcfromtimestamp(tz_aware.timestamp()).isoformat() + "+00:00"
+                    entity[prop] = attr
+                entities.append(entity)
+            group_info[cn] = entities
+    return group_info
 
 if not speed_it_up:
     # Create tables and indices
+    #TODO: ensure correct typing for ad properties being added
     c.execute('''CREATE TABLE hash_infos
-        (username_full text collate nocase, username text collate nocase, lm_hash text, lm_hash_left text, lm_hash_right text, nt_hash text, password text, lm_pass_left text, lm_pass_right text, only_lm_cracked boolean, history_index int, history_base_username text)''')
+        (username_full text collate nocase, username text collate nocase, lm_hash text, lm_hash_left text, lm_hash_right text, nt_hash text, password text, lm_pass_left text, lm_pass_right text, only_lm_cracked boolean, history_index int, history_base_username text, {0})'''.format(" text, ".join(ad_properties + " text"))
     c.execute("CREATE INDEX index_nt_hash ON hash_infos (nt_hash);")
     c.execute("CREATE INDEX index_lm_hash_left ON hash_infos (lm_hash_left);")
     c.execute("CREATE INDEX index_lm_hash_right ON hash_infos (lm_hash_right);")
@@ -182,92 +260,102 @@ if not speed_it_up:
 
     # Read users from each group; groups_users is a dictionary with key = group name and value = list of users
     groups_users = {}
-    for group in compare_groups:
-        user_domain = ""
-        user_name = ""
-        try:
-            users = []
-            fing = io.open(group[1], encoding='utf-16')
-            for line in fing:
-                if "MemberDomain" in line:
-                    user_domain = (line.split(":")[1]).strip()
-                if "MemberName" in line:
-                    user_name = (line.split(":")[1]).strip()
-                    users.append(user_domain + "\\" + user_name)
-        except:
-            print("Doesn't look like the Group Files are in the form output by PowerView, assuming the files are already in domain\\username list form")
-            # If the users array is empty, assume the file was not in the PowerView PowerShell script output format that you get from running:
-            # Get-NetGroupMember -GroupName "Enterprise Admins" -Domain "some.domain.com" -DomainController "DC01.some.domain.com" > Enterprise Admins.txt
-            # You can list domain controllers for use in the above command with Get-NetForestDomain
-            if len(users) == 0:
-                fing = open(group[1])
+    if args.pullFromAD:
+        groups_users = pull_ad_info(base_dn=args.baseDN,group_cns=compare_groups,properties=ad_properties)
+    else:
+        for group in compare_groups:
+            user_domain = ""
+            user_name = ""
+            try:
                 users = []
+                fing = io.open(group[1], encoding='utf-16')
                 for line in fing:
-                    users.append(line.rstrip("\r\n"))
-                fing.close()
-        groups_users[group[0]] = users
+                    if "MemberDomain" in line:
+                        user_domain = (line.split(":")[1]).strip()
+                    if "MemberName" in line:
+                        user_name = (line.split(":")[1]).strip()
+                        users.append({"UserPrincipalName":(user_domain + "\\" + user_name)})
+            except:
+                print("Doesn't look like the Group Files are in the form output by PowerView, assuming the files are already in domain\\username list form")
+                # If the users array is empty, assume the file was not in the PowerView PowerShell script output format that you get from running:
+                # Get-NetGroupMember -GroupName "Enterprise Admins" -Domain "some.domain.com" -DomainController "DC01.some.domain.com" > Enterprise Admins.txt
+                # You can list domain controllers for use in the above command with Get-NetForestDomain
+                if len(users) == 0:
+                    ext = group[1].split(".") [-1]
+                    users = []
+                    if ext == 'csv':
+                        with open(group[1],"r",encoding="UTF-8") as fing:
+                            csvreader = csv.DictReader(fing)
+                            for row in csvreader:
+                                users.append(row)
+                    elif ext == 'json':
+                        with open(group[1],"r",encoding="UTF-8") as fing:
+                            users = json.loads(fing.read())
+                    else:
+                        with open(group[1],"r",encoding="UTF-8") as fing:
+                            for line in fing:
+                                users.append({"UserPrincipalName":line.rstrip("\r\n"))
+            groups_users[group[0]] = users
 
     # Read in NTDS file
-    fin = open(ntds_file)
-    for line in fin:
-        vals = line.rstrip("\r\n").split(':')
-        if len(vals) == 1:
-            continue
-        usernameFull = vals[0]
-        lm_hash = vals[2]
-        lm_hash_left = lm_hash[0:16]
-        lm_hash_right = lm_hash[16:32]
-        nt_hash = vals[3]
-        username = usernameFull.split('\\')[-1]
-        history_base_username = usernameFull
-        history_index = -1
-        username_info = r"(?i)(.*\\*.*)_history([0-9]+)$"
-        results = re.search(username_info,usernameFull)
-        if results:
-            history_base_username = results.group(1)
-            history_index = results.group(2)
-        # Exclude machine accounts (where account name ends in $) by default
-        if args.machineaccts or not username.endswith("$"):
-            c.execute("INSERT INTO hash_infos (username_full, username, lm_hash , lm_hash_left , lm_hash_right , nt_hash, history_index, history_base_username) VALUES (?,?,?,?,?,?,?,?)",
-                    (usernameFull, username, lm_hash, lm_hash_left, lm_hash_right, nt_hash, history_index, history_base_username))
-    fin.close()
+    with open(ntds_file) as fin:
+        for line in fin:
+            vals = line.rstrip("\r\n").split(':')
+            if len(vals) == 1:
+                continue
+            usernameFull = vals[0]
+            lm_hash = vals[2]
+            lm_hash_left = lm_hash[0:16]
+            lm_hash_right = lm_hash[16:32]
+            nt_hash = vals[3]
+            username = usernameFull.split('\\')[-1]
+            history_base_username = usernameFull
+            history_index = -1
+            username_info = r"(?i)(.*\\*.*)_history([0-9]+)$"
+            results = re.search(username_info,usernameFull)
+            if results:
+                history_base_username = results.group(1)
+                history_index = results.group(2)
+            # Exclude machine accounts (where account name ends in $) by default
+            if args.machineaccts or not username.endswith("$"):
+                c.execute("INSERT INTO hash_infos (username_full, username, lm_hash , lm_hash_left , lm_hash_right , nt_hash, history_index, history_base_username) VALUES (?,?,?,?,?,?,?,?)",
+                        (usernameFull, username, lm_hash, lm_hash_left, lm_hash_right, nt_hash, history_index, history_base_username))
 
     # update group membership flags
     for group in groups_users:
         for user in groups_users[group]:
             sql = "UPDATE hash_infos SET \"" + group + \
-                "\" = 1 WHERE username_full = \"" + user + "\""
+                "\" = 1 WHERE username_full = \"" + user["UserPrincipalName"] + "\""
             c.execute(sql)
 
     # read in POT file
-    fin = open(cracked_file)
-    for lineT in fin:
-        line = lineT.rstrip('\r\n')
-        colon_index = line.find(":")
-        hash = line[0:colon_index]
-        # Stripping $NT$ and $LM$ that is included in John the Ripper output by default
-        jtr = False
-        if hash.startswith('$NT$') or hash.startswith('$LM$'):
-            hash = hash.lstrip("$NT$")
-            hash = hash.lstrip("$LM$")
-            jtr = True
-        password = line[colon_index+1:len(line)]
-        lenxx = len(hash)
-        if re.match(r"\$HEX\[([^\]]+)", password) and not jtr:
-            hex2 = (binascii.unhexlify(re.findall(r"\$HEX\[([^\]]+)", password)[-1]))
-            l = list()
-            for x in list(hex2):
-                if type(x) == int:
-                    x = str(chr(x))
-                l.append(x)
-            password = ""
-            password = password.join(l)
-        if lenxx == 32:  # An NT hash
-            c.execute("UPDATE hash_infos SET password = ? WHERE nt_hash = ?", (password, hash))
-        elif lenxx == 16:  # An LM hash, either left or right
-            c.execute("UPDATE hash_infos SET lm_pass_left = ? WHERE lm_hash_left = ?", (password, hash))
-            c.execute("UPDATE hash_infos SET lm_pass_right = ? WHERE lm_hash_right = ?", (password, hash))
-    fin.close()
+    with open(cracked_file) as fin:
+        for lineT in fin:
+            line = lineT.rstrip('\r\n')
+            colon_index = line.find(":")
+            hash = line[0:colon_index]
+            # Stripping $NT$ and $LM$ that is included in John the Ripper output by default
+            jtr = False
+            if hash.startswith('$NT$') or hash.startswith('$LM$'):
+                hash = hash.lstrip("$NT$")
+                hash = hash.lstrip("$LM$")
+                jtr = True
+            password = line[colon_index+1:len(line)]
+            lenxx = len(hash)
+            if re.match(r"\$HEX\[([^\]]+)", password) and not jtr:
+                hex2 = (binascii.unhexlify(re.findall(r"\$HEX\[([^\]]+)", password)[-1]))
+                l = list()
+                for x in list(hex2):
+                    if type(x) == int:
+                        x = str(chr(x))
+                    l.append(x)
+                password = ""
+                password = password.join(l)
+            if lenxx == 32:  # An NT hash
+                c.execute("UPDATE hash_infos SET password = ? WHERE nt_hash = ?", (password, hash))
+            elif lenxx == 16:  # An LM hash, either left or right
+                c.execute("UPDATE hash_infos SET lm_pass_left = ? WHERE lm_hash_left = ?", (password, hash))
+                c.execute("UPDATE hash_infos SET lm_pass_right = ? WHERE lm_hash_right = ?", (password, hash))
 
     # Do additional LM cracking
     c.execute('SELECT nt_hash,lm_pass_left,lm_pass_right FROM hash_infos WHERE (lm_pass_left is not NULL or lm_pass_right is not NULL) and password is NULL and lm_hash is not "aad3b435b51404eeaad3b435b51404ee" group by nt_hash')
