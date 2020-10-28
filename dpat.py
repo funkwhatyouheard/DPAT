@@ -28,7 +28,8 @@ from pprint import pprint
 filename_for_html_report = "_DomainPasswordAuditReport.html"
 folder_for_html_report = "DPAT Report"
 filename_for_db_on_disk = "pass_audit.db"
-ad_properties = ['SamAccountName','UserPrincipalName','Enabled','PwdLastSet','PasswordExpired','PasswordNeverExpires','whenCreated','whenChanged']
+#TODO: removed UserPrincipalName from ad_properties, but still pull as part of user object. Need to use to build username_full, but no need to put in report
+ad_properties = ['UserPrincipalName','Enabled','PwdLastSet','PasswordExpired','PasswordNeverExpires','whenCreated','whenChanged']
 compare_groups = []
 
 # This should be False as it is only a shortcut used during development
@@ -67,9 +68,13 @@ if args.sanitize:
 if args.groupdirectory is not None:
     args.grouplists = [os.path.join(args.groupdirectory,f) for f in os.listdir(args.groupdirectory) if os.path.isfile(os.path.join(args.groupdirectory,f))]
 if args.grouplists is not None:
-    for groupfile in args.grouplists:
-        compare_groups.append(
-            (os.path.splitext(os.path.basename(groupfile))[0], groupfile))
+    if args.pullFromAD:
+        for group in args.grouplists:
+            compare_groups.append((group,group))
+    else:
+        for groupfile in args.grouplists:
+            compare_groups.append(
+                (os.path.splitext(os.path.basename(groupfile))[0], groupfile))
 
 # create report folder if it doesn't already exist
 if not os.path.exists(folder_for_html_report):
@@ -176,6 +181,8 @@ def crack_it(nt_hash, lm_pass):
             break
     return password
 
+#TODO: break this out to have one function to handle groups, and one to handle users
+#TODO: pull information on all users and update DB
 def pull_ad_info(base_dn,group_cns=None,properties=None):
     group_info = dict()
     tz = tzlocal.get_localzone()
@@ -238,6 +245,7 @@ def pull_ad_info(base_dn,group_cns=None,properties=None):
                         tz_aware = dt.replace(tzinfo=tz)
                         attr = datetime.utcfromtimestamp(tz_aware.timestamp()).isoformat() + "+00:00"
                     entity[prop] = attr
+                entity['username_full'] = "{0}\\{1}".format(entity['UserPrincipalName'].split('@')[1],entity['UserPrincipalName'].split('@')[0])
                 entities.append(entity)
             group_info[cn] = entities
     return group_info
@@ -246,7 +254,7 @@ if not speed_it_up:
     # Create tables and indices
     #TODO: ensure correct typing for ad properties being added
     c.execute('''CREATE TABLE hash_infos
-        (username_full text collate nocase, username text collate nocase, lm_hash text, lm_hash_left text, lm_hash_right text, nt_hash text, password text, lm_pass_left text, lm_pass_right text, only_lm_cracked boolean, history_index int, history_base_username text, {0})'''.format(" text, ".join(ad_properties + " text")))
+        (username_full text collate nocase, username text collate nocase, lm_hash text, lm_hash_left text, lm_hash_right text, nt_hash text, password text, lm_pass_left text, lm_pass_right text, only_lm_cracked boolean, history_index int, history_base_username text, {0})'''.format(" text, ".join(ad_properties) + " text"))
     c.execute("CREATE INDEX index_nt_hash ON hash_infos (nt_hash);")
     c.execute("CREATE INDEX index_lm_hash_left ON hash_infos (lm_hash_left);")
     c.execute("CREATE INDEX index_lm_hash_right ON hash_infos (lm_hash_right);")
@@ -261,7 +269,7 @@ if not speed_it_up:
     # Read users from each group; groups_users is a dictionary with key = group name and value = list of users
     groups_users = {}
     if args.pullFromAD:
-        groups_users = pull_ad_info(base_dn=args.baseDN,group_cns=compare_groups,properties=ad_properties)
+        groups_users = pull_ad_info(base_dn=args.baseDN,group_cns=[g for _, g in compare_groups],properties=ad_properties)
     else:
         for group in compare_groups:
             user_domain = ""
@@ -322,11 +330,16 @@ if not speed_it_up:
                         (usernameFull, username, lm_hash, lm_hash_left, lm_hash_right, nt_hash, history_index, history_base_username))
 
     # update group membership flags
+    # TODO: currently only pull AD attributes for users in groups... need to pull for ALL users
     for group in groups_users:
         for user in groups_users[group]:
             sql = "UPDATE hash_infos SET \"" + group + \
-                "\" = 1 WHERE username_full = \"" + user["UserPrincipalName"] + "\""
+                "\" = 1 WHERE username_full = \"" + user["username_full"] + "\""
             c.execute(sql)
+            for prop in ad_properties:
+                sql = "UPDATE hash_infos SET \"" + prop + \
+                    "\" = \"" + str(user[prop]) + "\" WHERE username_full = \"" + user["username_full"] + "\""
+                c.execute(sql)
 
     # read in POT file
     with open(cracked_file) as fin:
@@ -375,13 +388,22 @@ if not speed_it_up:
         count -= 1
 
 # Total number of hashes in the NTDS file
-c.execute('SELECT username_full,password,LENGTH(password) as plen,nt_hash,only_lm_cracked FROM hash_infos WHERE history_index = -1 ORDER BY plen DESC, password')
+columns = ["Username", "Password", "Password Length", "NT Hash", "Only LM Cracked"]
+if args.pullFromAD:
+    columns.extend(ad_properties)
+    all_hashes_query = 'SELECT username_full,password,LENGTH(password) as plen,nt_hash,only_lm_cracked,'+ ",".join(ad_properties) + ' \
+        FROM hash_infos WHERE history_index = -1 ORDER BY plen DESC, password'
+else:
+    all_hashes_query = 'SELECT username_full,password,LENGTH(password) as plen,nt_hash,only_lm_cracked \
+        FROM hash_infos WHERE history_index = -1 ORDER BY plen DESC, password'
+c.execute(all_hashes_query)
 list = c.fetchall()
 
 num_hashes = len(list)
 hbt = HtmlBuilder()
+
 hbt.add_table_to_html(
-    list, ["Username", "Password", "Password Length", "NT Hash", "Only LM Cracked"])
+    list, columns)
 filename = hbt.write_html_report("all hashes.html")
 summary_table.append((num_hashes, "Password Hashes",
                       "<a href=\"" + filename + "\">Details</a>"))
@@ -422,6 +444,7 @@ for group in compare_groups:
     num_groupmembers = len(list)
     new_list = []
     for tuple in list:  # the tuple is (username_full, nt_hash, lm_hash)
+        # this handles the 'Users Sharing this Hash' column
         c.execute(
             "SELECT username_full FROM hash_infos WHERE nt_hash = \"" + tuple[1] + "\" AND history_index = -1")
         users_list = c.fetchall()
@@ -431,7 +454,9 @@ for group in compare_groups:
             new_tuple = tuple + (string_of_users,)
         else:
             new_tuple = tuple + ("Too Many to List",)
+        # this handles the 'Share Count' column
         new_tuple += (len(users_list),)
+        # adds the password to the tuple
         c.execute(
             "SELECT password,lm_hash FROM hash_infos WHERE nt_hash = \"" + tuple[1] + "\" AND history_index = -1 LIMIT 1")
         result = c.fetchone()
@@ -441,20 +466,32 @@ for group in compare_groups:
             new_tuple += ("Yes",)
         else:
             new_tuple += ("No",)
-        new_list.append(new_tuple)
-    headers = ["Username", "NT Hash", "Users Sharing this Hash",
+        headers = ["Username", "NT Hash", "Users Sharing this Hash",
                "Share Count", "Password", "Non-Blank LM Hash?"]
+        if args.pullFromAD:
+            c.execute(
+                "SELECT "+ ",".join(ad_properties) +" FROM hash_infos WHERE username_full = \"" + tuple[0] + "\" AND history_index = -1 LIMIT 1")
+            result = c.fetchone()
+            new_tuple += result
+            headers.extend(ad_properties)
+        new_list.append(new_tuple)
     hbt = HtmlBuilder()
     hbt.add_table_to_html(new_list, headers)
     filename = hbt.write_html_report(group[0] + " members.html")
     summary_table.append((num_groupmembers, "Members of \"%s\" group" %
                           group[0], "<a href=\"" + filename + "\">Details</a>"))
-    c.execute("SELECT username_full, LENGTH(password) as plen, password, only_lm_cracked FROM hash_infos WHERE \"" +
-              group[0] + "\" = 1 and password is not NULL and password is not '' ORDER BY plen")
-    group_cracked_list = c.fetchall()
-    num_groupmembers_cracked = len(group_cracked_list)
     headers = ["Username of \"" + group[0] + "\" Member",
                "Password Length", "Password", "Only LM Cracked"]
+    if args.pullFromAD:
+        headers.extend(ad_properties)
+        group_cracked_query = "SELECT username_full, LENGTH(password) as plen, password, only_lm_cracked, \""+ ", ".join(ad_properties) +\
+        "\"FROM hash_infos WHERE \"" + group[0] + "\" = 1 and password is not NULL and password is not '' ORDER BY plen"
+    else:
+        group_cracked_query = "SELECT username_full, LENGTH(password) as plen, password, only_lm_cracked FROM hash_infos WHERE \"" +\
+              group[0] + "\" = 1 and password is not NULL and password is not '' ORDER BY plen"
+    c.execute(group_cracked_query)
+    group_cracked_list = c.fetchall()
+    num_groupmembers_cracked = len(group_cracked_list)
     hbt = HtmlBuilder()
     hbt.add_table_to_html(group_cracked_list, headers)
     filename = hbt.write_html_report(group[0] + " cracked passwords.html")
@@ -498,6 +535,7 @@ c.execute('SELECT COUNT(DISTINCT nt_hash) FROM hash_infos WHERE only_lm_cracked 
 summary_table.append(
     (c.fetchone()[0], "Unique LM Hashes Cracked Where NT Hash was Not Cracked", None))
 
+#TODO: add some stats on password age
 # Password length statistics
 c.execute('SELECT LENGTH(password) as plen,COUNT(password) FROM hash_infos WHERE plen is not NULL AND history_index = -1 AND plen is not 0 GROUP BY plen ORDER BY plen')
 list = c.fetchall()
