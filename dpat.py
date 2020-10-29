@@ -28,8 +28,7 @@ from pprint import pprint
 filename_for_html_report = "_DomainPasswordAuditReport.html"
 folder_for_html_report = "DPAT Report"
 filename_for_db_on_disk = "pass_audit.db"
-#TODO: removed UserPrincipalName from ad_properties, but still pull as part of user object. Need to use to build username_full, but no need to put in report
-ad_properties = ['UserPrincipalName','Enabled','PwdLastSet','PasswordExpired','PasswordNeverExpires','whenCreated','whenChanged']
+ad_properties = ['Enabled','PwdLastSet','PasswordExpired','PasswordNeverExpires','whenCreated','whenChanged']
 compare_groups = []
 
 # This should be False as it is only a shortcut used during development
@@ -107,7 +106,7 @@ class HtmlBuilder:
     def get_html(self):
         return "<!DOCTYPE html>\n" + "<html>\n<head>\n<link rel='stylesheet' href='report.css'>\n</head>\n" + "<body>\n" + self.bodyStr + "</html>\n" + "</body>\n"
 
-    def add_table_to_html(self, list, headers=[], col_to_not_escape=None):
+    def add_table_to_html(self, table_list, headers=[], col_to_not_escape=None):
         html = '<table border="1">\n'
         html += "<tr>"
         for header in headers:
@@ -116,7 +115,7 @@ class HtmlBuilder:
             else:
                 html += "<th></th>"
         html += "</tr>\n"
-        for line in list:
+        for line in table_list:
             html += "<tr>"
             col_num = 0
             for column in line:
@@ -181,15 +180,58 @@ def crack_it(nt_hash, lm_pass):
             break
     return password
 
-#TODO: break this out to have one function to handle groups, and one to handle users
-#TODO: pull information on all users and update DB
-def pull_ad_info(base_dn,group_cns=None,properties=None):
-    group_info = dict()
-    tz = tzlocal.get_localzone()
-    if not isinstance(properties,list):
+def get_cn_by_samaccountname(samaccountname):
+    # lookup CN by samaccountname
+    q = adquery.ADQuery()
+    q.execute_query(attributes=['CN'],where_clause="SamAccountName = '{0}'".format(samaccountname),base_dn=args.baseDN)
+    user_cn = q.get_all_results()
+    if len(user_cn) == 0:
+        #print("Couldn't find user with samaccountname {0}".format(samaccountname))
+        return None
+    else:
+        user_cn = user_cn[0]['CN']
+    return user_cn
+
+def get_aduser_properties(username,username_full,properties):
+    if not isinstance(properties, list):
         properties = [properties]
-    if 'UserPrincipalName' not in properties:
-        properties.append('UserPrincipalName')
+    tz = tzlocal.get_localzone()
+    entity = dict()
+    try: 
+        user = aduser.ADUser.from_cn(username)
+    except: 
+        #print("Couldn't find user by CN: {0}; attempting to search as samaccountname".format(username))
+        user = aduser.ADUser.from_cn(get_cn_by_samaccountname(username))
+    try:
+        for prop in properties:
+            # have to pull these out of UAC settings
+            if prop == "Enabled":
+                attr = not user.get_user_account_control_settings()['ACCOUNTDISABLE']
+            elif prop == "PasswordExpired":
+                attr = user.get_user_account_control_settings()['PASSWORD_EXPIRED']
+            elif prop == "PasswordNeverExpires":
+                attr = user.get_user_account_control_settings()['DONT_EXPIRE_PASSWD']
+            else:
+                attr = user.get_attribute(prop)
+            attr = attr[0] if isinstance(attr,list) and len(attr) >= 1 else attr
+            if isinstance(attr,TimeType):
+                # these will be in UTC
+                attr = attr.isoformat()
+            if isinstance(attr,client.CDispatch):
+                # these will be in local time
+                # convert localtime to UTC
+                dt = pyadutils.convert_datetime(attr)
+                tz_aware = dt.replace(tzinfo=tz)
+                attr = datetime.utcfromtimestamp(tz_aware.timestamp()).isoformat() + "+00:00"
+            entity[prop] = attr
+        entity['username_full'] = username_full
+        #entity['SamAccountName'] = samaccountname
+    except:
+        print("Couldn't find {0}".format(username))
+    return entity
+
+def get_group_members(base_dn,group_cns=None):
+    group_info = dict()
     if not isinstance(group_cns,list):
         group_cns = [group_cns]
     # if no groups specified, get all groups
@@ -223,36 +265,16 @@ def pull_ad_info(base_dn,group_cns=None,properties=None):
                 if member._type == 'foreign-security-principal':
                     print("Skipping foreign SID\n{0}".format(member.adsPath))
                     continue
-                entity = dict()
-                for prop in properties:
-                    # have to pull these out of UAC settings
-                    if prop == "Enabled":
-                        attr = not member.get_user_account_control_settings()['ACCOUNTDISABLE']
-                    elif prop == "PasswordExpired":
-                        attr = member.get_user_account_control_settings()['PASSWORD_EXPIRED']
-                    elif prop == "PasswordNeverExpires":
-                        attr = member.get_user_account_control_settings()['DONT_EXPIRE_PASSWD']
-                    else:
-                        attr = member.get_attribute(prop)
-                    attr = attr[0] if isinstance(attr,list) and len(attr) >= 1 else attr
-                    if isinstance(attr,TimeType):
-                        # these will be in UTC
-                        attr = attr.isoformat()
-                    if isinstance(attr,client.CDispatch):
-                        # convert localtime to UTC
-                        # these will be in local time
-                        dt = pyadutils.convert_datetime(attr)
-                        tz_aware = dt.replace(tzinfo=tz)
-                        attr = datetime.utcfromtimestamp(tz_aware.timestamp()).isoformat() + "+00:00"
-                    entity[prop] = attr
-                entity['username_full'] = "{0}\\{1}".format(entity['UserPrincipalName'].split('@')[1],entity['UserPrincipalName'].split('@')[0])
-                entities.append(entity)
+                #entities.append(get_aduser_info(user_cn=member.get_attribute('CN'),properties=properties))
+                upn = member.get_attribute('UserPrincipalName')
+                upn = upn[0] if len(upn) >= 1 else None
+                username_full = "{0}\\{1}".format(upn.split('@')[1],upn.split('@')[0])
+                entities.append(username_full)
             group_info[cn] = entities
     return group_info
 
 if not speed_it_up:
     # Create tables and indices
-    #TODO: ensure correct typing for ad properties being added
     c.execute('''CREATE TABLE hash_infos
         (username_full text collate nocase, username text collate nocase, lm_hash text, lm_hash_left text, lm_hash_right text, nt_hash text, password text, lm_pass_left text, lm_pass_right text, only_lm_cracked boolean, history_index int, history_base_username text, {0})'''.format(" text, ".join(ad_properties) + " text"))
     c.execute("CREATE INDEX index_nt_hash ON hash_infos (nt_hash);")
@@ -269,8 +291,13 @@ if not speed_it_up:
     # Read users from each group; groups_users is a dictionary with key = group name and value = list of users
     groups_users = {}
     if args.pullFromAD:
-        groups_users = pull_ad_info(base_dn=args.baseDN,group_cns=[g for _, g in compare_groups],properties=ad_properties)
+        # pull non-foreign SID group members recursively
+        groups_users = get_group_members(base_dn=args.baseDN,group_cns=[g for _, g in compare_groups])
+        # insert desired AD properties into DB
+
     else:
+        #TODO: fix this to create user_fullname from UPN if there
+        #TODO: update ad_properties based on json/csv headers
         for group in compare_groups:
             user_domain = ""
             user_name = ""
@@ -330,16 +357,15 @@ if not speed_it_up:
                         (usernameFull, username, lm_hash, lm_hash_left, lm_hash_right, nt_hash, history_index, history_base_username))
 
     # update group membership flags
-    # TODO: currently only pull AD attributes for users in groups... need to pull for ALL users
     for group in groups_users:
         for user in groups_users[group]:
             sql = "UPDATE hash_infos SET \"" + group + \
-                "\" = 1 WHERE username_full = \"" + user["username_full"] + "\""
+                "\" = 1 WHERE username_full = \"" + user + "\""
             c.execute(sql)
-            for prop in ad_properties:
-                sql = "UPDATE hash_infos SET \"" + prop + \
-                    "\" = \"" + str(user[prop]) + "\" WHERE username_full = \"" + user["username_full"] + "\""
-                c.execute(sql)
+            #for prop in ad_properties:
+            #    sql = "UPDATE hash_infos SET \"" + prop + \
+            #        "\" = \"" + str(user[prop]) + "\" WHERE username_full = \"" + user + "\""
+            #    c.execute(sql)
 
     # read in POT file
     with open(cracked_file) as fin:
@@ -372,11 +398,11 @@ if not speed_it_up:
 
     # Do additional LM cracking
     c.execute('SELECT nt_hash,lm_pass_left,lm_pass_right FROM hash_infos WHERE (lm_pass_left is not NULL or lm_pass_right is not NULL) and password is NULL and lm_hash is not "aad3b435b51404eeaad3b435b51404ee" group by nt_hash')
-    list = c.fetchall()
-    count = len(list)
+    result_list = c.fetchall()
+    count = len(result_list)
     if count != 0:
         print("Cracking %d NT Hashes where only LM Hash was cracked (aka lm2ntcrack functionality)" % count)
-    for pair in list:
+    for pair in result_list:
         lm_pwd = ""
         if pair[1] is not None:
             lm_pwd += pair[1]
@@ -390,6 +416,32 @@ if not speed_it_up:
 # Total number of hashes in the NTDS file
 columns = ["Username", "Password", "Password Length", "NT Hash", "Only LM Cracked"]
 if args.pullFromAD:
+    # get users and translate to UPN
+    #c.execute("SELECT username_full from hash_infos")
+    c.execute("SELECT username, username_full from hash_infos")
+    all_usernames = [u for u in c.fetchall()]
+    # query prep
+    query_prep = ['{0}=?'.format(ad_properties[i]) for i in range(0,len(ad_properties))]
+    set_string = ",".join(query_prep)
+    counter = 0
+    #for upn in upns:
+    for user in all_usernames:
+        update_data = ()
+        counter += 1
+        if not (counter % 500):
+            print("Pulling AD attributes...{0}/{1} completed".format(counter,len(all_usernames)))
+        try:
+            user_properties = get_aduser_properties(username=user[0],username_full=user[1],properties=ad_properties)
+            if user_properties is not None:
+                update_query = "UPDATE hash_infos SET {0} WHERE username_full = \"{1}\"".format(set_string,user_properties['username_full'])
+                for p in [(user_properties[k],) for k in ad_properties]:
+                    update_data += p
+                # update the entry
+                c.execute(update_query, update_data)    
+            #else:
+                #print("Failed to process {0}".format(user[1]))
+        except:
+            continue
     columns.extend(ad_properties)
     all_hashes_query = 'SELECT username_full,password,LENGTH(password) as plen,nt_hash,only_lm_cracked,'+ ",".join(ad_properties) + ' \
         FROM hash_infos WHERE history_index = -1 ORDER BY plen DESC, password'
@@ -397,13 +449,13 @@ else:
     all_hashes_query = 'SELECT username_full,password,LENGTH(password) as plen,nt_hash,only_lm_cracked \
         FROM hash_infos WHERE history_index = -1 ORDER BY plen DESC, password'
 c.execute(all_hashes_query)
-list = c.fetchall()
+result_list = c.fetchall()
 
-num_hashes = len(list)
+num_hashes = len(result_list)
 hbt = HtmlBuilder()
 
 hbt.add_table_to_html(
-    list, columns)
+    result_list, columns)
 filename = hbt.write_html_report("all hashes.html")
 summary_table.append((num_hashes, "Password Hashes",
                       "<a href=\"" + filename + "\">Details</a>"))
@@ -440,10 +492,10 @@ for group in compare_groups:
     c.execute(
         "SELECT username_full,nt_hash FROM hash_infos WHERE \"" + group[0] + "\" = 1 AND history_index = -1")
     # this list contains the username_full and nt_hash of all users in this group
-    list = c.fetchall()
-    num_groupmembers = len(list)
+    result_list = c.fetchall()
+    num_groupmembers = len(result_list)
     new_list = []
-    for tuple in list:  # the tuple is (username_full, nt_hash, lm_hash)
+    for tuple in result_list:  # the tuple is (username_full, nt_hash, lm_hash)
         # this handles the 'Users Sharing this Hash' column
         c.execute(
             "SELECT username_full FROM hash_infos WHERE nt_hash = \"" + tuple[1] + "\" AND history_index = -1")
@@ -508,14 +560,14 @@ summary_table.append((c.fetchone()[0], "Unique LM Hashes (Non-blank)", None))
 
 # Number of passwords that are LM cracked for which you don't have the exact (case sensitive) password.
 c.execute('SELECT lm_hash, lm_pass_left, lm_pass_right, nt_hash FROM hash_infos WHERE (lm_pass_left is not "" or lm_pass_right is not "") AND history_index = -1 and password is NULL and lm_hash is not "aad3b435b51404eeaad3b435b51404ee" group by lm_hash')
-list = c.fetchall()
-num_lm_hashes_cracked_where_nt_hash_not_cracked = len(list)
+result_list = c.fetchall()
+num_lm_hashes_cracked_where_nt_hash_not_cracked = len(result_list)
 output = "WARNING there were %d unique LM hashes for which you do not have the password." % num_lm_hashes_cracked_where_nt_hash_not_cracked
 if num_lm_hashes_cracked_where_nt_hash_not_cracked != 0:
     hbt = HtmlBuilder()
     headers = ["LM Hash", "Left Portion of Password",
                "Right Portion of Password", "NT Hash"]
-    hbt.add_table_to_html(list, headers)
+    hbt.add_table_to_html(result_list, headers)
     filename = hbt.write_html_report("lm_noncracked.html")
     hb.build_html_body_string(
         output + ' <a href="' + filename + '">Details</a>')
@@ -524,12 +576,12 @@ if num_lm_hashes_cracked_where_nt_hash_not_cracked != 0:
 
 # Count and List of passwords that were only able to be cracked because the LM hash was available, includes usernames
 c.execute('SELECT username_full,password,LENGTH(password) as plen,only_lm_cracked FROM hash_infos WHERE only_lm_cracked = 1 ORDER BY plen AND history_index = -1')
-list = c.fetchall()
+result_list = c.fetchall()
 hbt = HtmlBuilder()
 headers = ["Username", "Password", "Password Length", "Only LM Cracked"]
-hbt.add_table_to_html(list, headers)
+hbt.add_table_to_html(result_list, headers)
 filename = hbt.write_html_report("users_only_cracked_through_lm.html")
-summary_table.append((len(list), "Passwords Only Cracked via LM Hash",
+summary_table.append((len(result_list), "Passwords Only Cracked via LM Hash",
                       "<a href=\"" + filename + "\">Details</a>"))
 c.execute('SELECT COUNT(DISTINCT nt_hash) FROM hash_infos WHERE only_lm_cracked = 1 AND history_index = -1')
 summary_table.append(
@@ -538,9 +590,9 @@ summary_table.append(
 #TODO: add some stats on password age
 # Password length statistics
 c.execute('SELECT LENGTH(password) as plen,COUNT(password) FROM hash_infos WHERE plen is not NULL AND history_index = -1 AND plen is not 0 GROUP BY plen ORDER BY plen')
-list = c.fetchall()
+result_list = c.fetchall()
 counter = 0
-for tuple in list:
+for tuple in result_list:
     length = str(tuple[0])
     c.execute('SELECT username FROM hash_infos WHERE history_index = -1 AND LENGTH(password) = ' + length)
     usernames = c.fetchall()
@@ -548,34 +600,34 @@ for tuple in list:
     headers = ["Users with a password length of " + length]
     hbt.add_table_to_html(usernames, headers)
     filename = hbt.write_html_report(str(counter) + "length_usernames.html")
-    list[counter] += ("<a href=\"" + filename + "\">Details</a>",)
+    result_list[counter] += ("<a href=\"" + filename + "\">Details</a>",)
     counter += 1
 hbt = HtmlBuilder()
 headers = ["Password Length", "Count", "Details"]
-hbt.add_table_to_html(list, headers, 2)
+hbt.add_table_to_html(result_list, headers, 2)
 c.execute('SELECT COUNT(password) as count, LENGTH(password) as plen FROM hash_infos WHERE plen is not NULL AND history_index = -1 and plen is not 0 GROUP BY plen ORDER BY count DESC')
-list = c.fetchall()
+result_list = c.fetchall()
 headers = ["Count", "Password Length"]
-hbt.add_table_to_html(list, headers)
+hbt.add_table_to_html(result_list, headers)
 filename = hbt.write_html_report("password_length_stats.html")
 summary_table.append((None, "Password Length Stats",
                       "<a href=\"" + filename + "\">Details</a>"))
 
 # Top Ten Passwords Used
 c.execute('SELECT password,COUNT(password) as count FROM hash_infos WHERE password is not NULL AND history_index = -1 and password is not "" GROUP BY password ORDER BY count DESC LIMIT 20')
-list = c.fetchall()
+result_list = c.fetchall()
 hbt = HtmlBuilder()
 headers = ["Password", "Count"]
-hbt.add_table_to_html(list, headers)
+hbt.add_table_to_html(result_list, headers)
 filename = hbt.write_html_report("top_password_stats.html")
 summary_table.append((None, "Top Password Use Stats",
                       "<a href=\"" + filename + "\">Details</a>"))
 
 # Password Reuse Statistics (based only on NT hash)
 c.execute('SELECT nt_hash, COUNT(nt_hash) as count, password FROM hash_infos WHERE nt_hash is not "31d6cfe0d16ae931b73c59d7e0c089c0" AND history_index = -1 GROUP BY nt_hash ORDER BY count DESC LIMIT 20')
-list = c.fetchall()
+result_list = c.fetchall()
 counter = 0
-for tuple in list:
+for tuple in result_list:
     c.execute(
         'SELECT username FROM hash_infos WHERE nt_hash = \"' + tuple[0] + '\" AND history_index = -1')
     usernames = c.fetchall()
@@ -587,11 +639,11 @@ for tuple in list:
                sanitize(tuple[0]) + ":" + sanitize(password)]
     hbt.add_table_to_html(usernames, headers)
     filename = hbt.write_html_report(str(counter) + "reuse_usernames.html")
-    list[counter] += ("<a href=\"" + filename + "\">Details</a>",)
+    result_list[counter] += ("<a href=\"" + filename + "\">Details</a>",)
     counter += 1
 hbt = HtmlBuilder()
 headers = ["NT Hash", "Count", "Password", "Details"]
-hbt.add_table_to_html(list, headers, 3)
+hbt.add_table_to_html(result_list, headers, 3)
 filename = hbt.write_html_report("password_reuse_stats.html")
 summary_table.append((None, "Password Reuse Stats",
                       "<a href=\"" + filename + "\">Details</a>"))
@@ -618,9 +670,9 @@ else:
     command += (' FROM hash_infos GROUP BY history_base_username) ')
     command += "WHERE coalesce(" + ",".join(column_names) + ") is not NULL"
     c.execute(command)
-    list = c.fetchall()
+    result_list = c.fetchall()
     headers = password_history_headers
-    hbt.add_table_to_html(list, headers, 8)
+    hbt.add_table_to_html(result_list, headers, 8)
 filename=hbt.write_html_report("password_history.html")
 summary_table.append((None, "Password History",
                 "<a href=\"" + filename + "\">Details</a>"))
