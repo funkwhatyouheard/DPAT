@@ -66,7 +66,12 @@ folder_for_html_report = args.reportdirectory
 if args.sanitize:
     folder_for_html_report = folder_for_html_report + "_Sanitized"
 if args.groupdirectory is not None:
-    args.grouplists = [os.path.join(args.groupdirectory,f) for f in os.listdir(args.groupdirectory) if os.path.isfile(os.path.join(args.groupdirectory,f))]
+    # gather everything in the directory
+    if args.grouplist is None:
+        args.grouplists = [os.path.join(args.groupdirectory,f) for f in os.listdir(args.groupdirectory) if os.path.isfile(os.path.join(args.groupdirectory,f))]
+    # gather just the specified files
+    else:
+        args.grouplist = [os.path.join(args.groupdirectory,f) for f in args.grouplist if os.path.isfile(os.path.join(args.groupdirectory,f))]
 if args.grouplists is not None:
     if args.pullFromAD:
         for group in args.grouplists:
@@ -227,7 +232,7 @@ def get_aduser_properties(username,username_full,properties):
             entity[prop] = attr
         entity['username_full'] = username_full
     except:
-        print("Couldn't find {0}".format(username))
+        print("Couldn't find account: {0}".format(username))
     return entity
 
 def get_group_members(base_dn,group_cns=None):
@@ -267,6 +272,8 @@ def get_group_members(base_dn,group_cns=None):
                     continue
                 upn = member.get_attribute('UserPrincipalName')
                 upn = upn[0] if len(upn) >= 1 else None
+                if upn is None:
+                    continue
                 username_full = "{0}\\{1}".format(upn.split('@')[1],upn.split('@')[0])
                 entities.append(username_full)
             group_info[cn] = entities
@@ -436,7 +443,7 @@ if args.pullFromAD or extended_file_properties:
             update_data = ()
             counter += 1
             if not (counter % 500):
-                print("Pulling AD attributes...{0}/{1} completed".format(counter,len(all_usernames)))
+                print("Pulling AD attributes...{0}/{1} accounts completed".format(counter,len(all_usernames)))
             try:
                 user_properties = get_aduser_properties(username=user[0],username_full=user[1],properties=ad_properties)
                 if user_properties is not None:
