@@ -210,13 +210,13 @@ def get_aduser_properties(username,username_full,properties):
         for prop in properties:
             # have to pull these out of UAC settings
             if prop == "Enabled":
-                attr = not str(user.get_user_account_control_settings()['ACCOUNTDISABLE'])
+                attr = not user.get_user_account_control_settings()['ACCOUNTDISABLE']
             elif prop == "PasswordExpired":
-                attr = str(user.get_user_account_control_settings()['PASSWORD_EXPIRED'])
+                attr = user.get_user_account_control_settings()['PASSWORD_EXPIRED']
             elif prop == "PasswordNeverExpires":
-                attr = str(user.get_user_account_control_settings()['DONT_EXPIRE_PASSWD'])
+                attr = user.get_user_account_control_settings()['DONT_EXPIRE_PASSWD']
             elif prop == "PasswordNotRequired":
-                attr = str(user.get_user_account_control_settings()['PASSWD_NOTREQD'])
+                attr = user.get_user_account_control_settings()['PASSWD_NOTREQD']
             else:
                 attr = user.get_attribute(prop)
             attr = attr[0] if isinstance(attr,list) and len(attr) >= 1 else attr
@@ -229,6 +229,8 @@ def get_aduser_properties(username,username_full,properties):
                 dt = pyadutils.convert_datetime(attr)
                 tz_aware = dt.replace(tzinfo=tz)
                 attr = datetime.utcfromtimestamp(tz_aware.timestamp()).isoformat() + "+00:00"
+            if isinstance(attr,bool):
+                attr = str(attr)
             entity[prop] = attr
         entity['username_full'] = username_full
     except:
