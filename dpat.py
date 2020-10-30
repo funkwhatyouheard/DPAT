@@ -28,7 +28,7 @@ from pprint import pprint
 filename_for_html_report = "_DomainPasswordAuditReport.html"
 folder_for_html_report = "DPAT Report"
 filename_for_db_on_disk = "pass_audit.db"
-ad_properties = ['Enabled','PwdLastSet','PasswordExpired','PasswordNeverExpires','whenCreated','whenChanged']
+ad_properties = ['Enabled','PwdLastSet','PasswordExpired','PasswordNeverExpires','PasswordNotRequired','whenCreated','whenChanged']
 extended_file_properties = False
 compare_groups = []
 
@@ -210,6 +210,8 @@ def get_aduser_properties(username,username_full,properties):
                 attr = user.get_user_account_control_settings()['PASSWORD_EXPIRED']
             elif prop == "PasswordNeverExpires":
                 attr = user.get_user_account_control_settings()['DONT_EXPIRE_PASSWD']
+            elif prop == "PasswordNotRequired":
+                attr = user.get_user_account_control_settings()['PASSWD_NOTREQD']
             else:
                 attr = user.get_attribute(prop)
             attr = attr[0] if isinstance(attr,list) and len(attr) >= 1 else attr
@@ -224,7 +226,6 @@ def get_aduser_properties(username,username_full,properties):
                 attr = datetime.utcfromtimestamp(tz_aware.timestamp()).isoformat() + "+00:00"
             entity[prop] = attr
         entity['username_full'] = username_full
-        #entity['SamAccountName'] = samaccountname
     except:
         print("Couldn't find {0}".format(username))
     return entity
