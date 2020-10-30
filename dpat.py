@@ -548,8 +548,8 @@ for group in compare_groups:
                "Password Length", "Password", "Only LM Cracked"]
     if args.pullFromAD or extended_file_properties:
         headers.extend(ad_properties)
-        group_cracked_query = "SELECT username_full, LENGTH(password) as plen, password, only_lm_cracked, \""+ ", ".join(ad_properties) +\
-        "\"FROM hash_infos WHERE \"" + group[0] + "\" = 1 and password is not NULL and password is not '' ORDER BY plen"
+        group_cracked_query = "SELECT username_full, LENGTH(password) as plen, password, only_lm_cracked, "+ ", ".join(ad_properties) +\
+        " FROM hash_infos WHERE \"" + group[0] + "\" = 1 and password is not NULL and password is not '' ORDER BY plen"
     else:
         group_cracked_query = "SELECT username_full, LENGTH(password) as plen, password, only_lm_cracked FROM hash_infos WHERE \"" +\
               group[0] + "\" = 1 and password is not NULL and password is not '' ORDER BY plen"
