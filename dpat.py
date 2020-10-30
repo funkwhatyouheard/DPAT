@@ -192,8 +192,6 @@ def get_cn_by_samaccountname(samaccountname):
         user_cn = user_cn[0]['CN']
     return user_cn
 
-def bool_to
-
 def get_aduser_properties(username,username_full,properties):
     if not isinstance(properties, list):
         properties = [properties]
