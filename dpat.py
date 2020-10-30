@@ -29,6 +29,7 @@ filename_for_html_report = "_DomainPasswordAuditReport.html"
 folder_for_html_report = "DPAT Report"
 filename_for_db_on_disk = "pass_audit.db"
 ad_properties = ['Enabled','PwdLastSet','PasswordExpired','PasswordNeverExpires','whenCreated','whenChanged']
+extended_file_properties = False
 compare_groups = []
 
 # This should be False as it is only a shortcut used during development
@@ -186,7 +187,6 @@ def get_cn_by_samaccountname(samaccountname):
     q.execute_query(attributes=['CN'],where_clause="SamAccountName = '{0}'".format(samaccountname),base_dn=args.baseDN)
     user_cn = q.get_all_results()
     if len(user_cn) == 0:
-        #print("Couldn't find user with samaccountname {0}".format(samaccountname))
         return None
     else:
         user_cn = user_cn[0]['CN']
@@ -200,7 +200,6 @@ def get_aduser_properties(username,username_full,properties):
     try: 
         user = aduser.ADUser.from_cn(username)
     except: 
-        #print("Couldn't find user by CN: {0}; attempting to search as samaccountname".format(username))
         user = aduser.ADUser.from_cn(get_cn_by_samaccountname(username))
     try:
         for prop in properties:
@@ -265,7 +264,6 @@ def get_group_members(base_dn,group_cns=None):
                 if member._type == 'foreign-security-principal':
                     print("Skipping foreign SID\n{0}".format(member.adsPath))
                     continue
-                #entities.append(get_aduser_info(user_cn=member.get_attribute('CN'),properties=properties))
                 upn = member.get_attribute('UserPrincipalName')
                 upn = upn[0] if len(upn) >= 1 else None
                 username_full = "{0}\\{1}".format(upn.split('@')[1],upn.split('@')[0])
@@ -274,30 +272,11 @@ def get_group_members(base_dn,group_cns=None):
     return group_info
 
 if not speed_it_up:
-    # Create tables and indices
-    c.execute('''CREATE TABLE hash_infos
-        (username_full text collate nocase, username text collate nocase, lm_hash text, lm_hash_left text, lm_hash_right text, nt_hash text, password text, lm_pass_left text, lm_pass_right text, only_lm_cracked boolean, history_index int, history_base_username text, {0})'''.format(" text, ".join(ad_properties) + " text"))
-    c.execute("CREATE INDEX index_nt_hash ON hash_infos (nt_hash);")
-    c.execute("CREATE INDEX index_lm_hash_left ON hash_infos (lm_hash_left);")
-    c.execute("CREATE INDEX index_lm_hash_right ON hash_infos (lm_hash_right);")
-    c.execute("CREATE INDEX lm_hash ON hash_infos (lm_hash);")
-    c.execute("CREATE INDEX username ON hash_infos (username);")
-
-    # Create boolean column for each group
-    for group in compare_groups:
-        sql = "ALTER TABLE hash_infos ADD COLUMN \"" + group[0] + "\" boolean"
-        c.execute(sql)
-
-    # Read users from each group; groups_users is a dictionary with key = group name and value = list of users
     groups_users = {}
     if args.pullFromAD:
         # pull non-foreign SID group members recursively
         groups_users = get_group_members(base_dn=args.baseDN,group_cns=[g for _, g in compare_groups])
-        # insert desired AD properties into DB
-
     else:
-        #TODO: fix this to create user_fullname from UPN if there
-        #TODO: update ad_properties based on json/csv headers
         for group in compare_groups:
             user_domain = ""
             user_name = ""
@@ -309,9 +288,9 @@ if not speed_it_up:
                         user_domain = (line.split(":")[1]).strip()
                     if "MemberName" in line:
                         user_name = (line.split(":")[1]).strip()
-                        users.append({"UserPrincipalName":(user_domain + "\\" + user_name)})
+                        users.append((user_domain + "\\" + user_name))
             except:
-                print("Doesn't look like the Group Files are in the form output by PowerView, assuming the files are already in domain\\username list form")
+                print("Doesn't look like the Group Files are in the form output by PowerView, assuming the files are already in domain\\username list form unless they are csv/json format")
                 # If the users array is empty, assume the file was not in the PowerView PowerShell script output format that you get from running:
                 # Get-NetGroupMember -GroupName "Enterprise Admins" -Domain "some.domain.com" -DomainController "DC01.some.domain.com" > Enterprise Admins.txt
                 # You can list domain controllers for use in the above command with Get-NetForestDomain
@@ -323,14 +302,34 @@ if not speed_it_up:
                             csvreader = csv.DictReader(fing)
                             for row in csvreader:
                                 users.append(row)
+                        extended_file_properties = True
+                        ad_properties = [header for _,header in enumerate(users[0])]
                     elif ext == 'json':
                         with open(group[1],"r",encoding="UTF-8") as fing:
                             users = json.loads(fing.read())
+                        extended_file_properties = True
+                        ad_properties = [header for _,header in enumerate(users[0])]
                     else:
                         with open(group[1],"r",encoding="UTF-8") as fing:
                             for line in fing:
-                                users.append({"UserPrincipalName":line.rstrip("\r\n")})
+                                users.append(line.rstrip("\r\n"))
             groups_users[group[0]] = users
+
+    # Create tables and indices
+    # moving here so ad_properties can be updated first if needed
+    c.execute('''CREATE TABLE hash_infos
+        (username_full text collate nocase, username text collate nocase, lm_hash text, lm_hash_left text, lm_hash_right text, nt_hash text, password text, 
+        lm_pass_left text, lm_pass_right text, only_lm_cracked boolean, history_index int, history_base_username text, {0})'''.format(" text, ".join(ad_properties) + " text"))
+    c.execute("CREATE INDEX index_nt_hash ON hash_infos (nt_hash);")
+    c.execute("CREATE INDEX index_lm_hash_left ON hash_infos (lm_hash_left);")
+    c.execute("CREATE INDEX index_lm_hash_right ON hash_infos (lm_hash_right);")
+    c.execute("CREATE INDEX lm_hash ON hash_infos (lm_hash);")
+    c.execute("CREATE INDEX username ON hash_infos (username);")
+
+    # Create boolean column for each group
+    for group in compare_groups:
+        sql = "ALTER TABLE hash_infos ADD COLUMN \"" + group[0] + "\" boolean"
+        c.execute(sql)
 
     # Read in NTDS file
     with open(ntds_file) as fin:
@@ -356,16 +355,23 @@ if not speed_it_up:
                 c.execute("INSERT INTO hash_infos (username_full, username, lm_hash , lm_hash_left , lm_hash_right , nt_hash, history_index, history_base_username) VALUES (?,?,?,?,?,?,?,?)",
                         (usernameFull, username, lm_hash, lm_hash_left, lm_hash_right, nt_hash, history_index, history_base_username))
 
-    # update group membership flags
+    # update group membership flags, if file was json/csv may need to udpate entries
     for group in groups_users:
-        for user in groups_users[group]:
-            sql = "UPDATE hash_infos SET \"" + group + \
-                "\" = 1 WHERE username_full = \"" + user + "\""
-            c.execute(sql)
-            #for prop in ad_properties:
-            #    sql = "UPDATE hash_infos SET \"" + prop + \
-            #        "\" = \"" + str(user[prop]) + "\" WHERE username_full = \"" + user + "\""
-            #    c.execute(sql)
+            for user in groups_users[group]:
+                if extended_file_properties:
+                    if 'UserPrincipalName' in user:
+                        upn = user['UserPrincipalName'].split("@")
+                        sql = "UPDATE hash_infos SET " 
+                        for prop in ad_properties:
+                            sql += ("\"" + prop + "\" = \"" + str(user[prop]) + "\",")
+                        
+                        sql = sql + "\"" + group + "\" = 1 WHERE username_full = \"" + (upn[1] + "\\" + upn[0]) + "\""
+                    else:
+                        raise KeyError("User didn't contain UPN. Required to process from csv/json file. {0}".format(user))
+                else:
+                    sql = "UPDATE hash_infos SET \"" + group + \
+                        "\" = 1 WHERE username_full = \"" + user + "\""
+                c.execute(sql)
 
     # read in POT file
     with open(cracked_file) as fin:
@@ -415,33 +421,31 @@ if not speed_it_up:
 
 # Total number of hashes in the NTDS file
 columns = ["Username", "Password", "Password Length", "NT Hash", "Only LM Cracked"]
-if args.pullFromAD:
-    # get users and translate to UPN
-    #c.execute("SELECT username_full from hash_infos")
-    c.execute("SELECT username, username_full from hash_infos")
-    all_usernames = [u for u in c.fetchall()]
-    # query prep
-    query_prep = ['{0}=?'.format(ad_properties[i]) for i in range(0,len(ad_properties))]
-    set_string = ",".join(query_prep)
-    counter = 0
-    #for upn in upns:
-    for user in all_usernames:
-        update_data = ()
-        counter += 1
-        if not (counter % 500):
-            print("Pulling AD attributes...{0}/{1} completed".format(counter,len(all_usernames)))
-        try:
-            user_properties = get_aduser_properties(username=user[0],username_full=user[1],properties=ad_properties)
-            if user_properties is not None:
-                update_query = "UPDATE hash_infos SET {0} WHERE username_full = \"{1}\"".format(set_string,user_properties['username_full'])
-                for p in [(user_properties[k],) for k in ad_properties]:
-                    update_data += p
-                # update the entry
-                c.execute(update_query, update_data)    
-            #else:
-                #print("Failed to process {0}".format(user[1]))
-        except:
-            continue
+if args.pullFromAD or extended_file_properties:
+    if args.pullFromAD:
+        # get users
+        c.execute("SELECT username, username_full from hash_infos")
+        all_usernames = [u for u in c.fetchall()]
+        # query prep
+        query_prep = ['{0}=?'.format(ad_properties[i]) for i in range(0,len(ad_properties))]
+        set_string = ",".join(query_prep)
+        counter = 0
+        #for upn in upns:
+        for user in all_usernames:
+            update_data = ()
+            counter += 1
+            if not (counter % 500):
+                print("Pulling AD attributes...{0}/{1} completed".format(counter,len(all_usernames)))
+            try:
+                user_properties = get_aduser_properties(username=user[0],username_full=user[1],properties=ad_properties)
+                if user_properties is not None:
+                    update_query = "UPDATE hash_infos SET {0} WHERE username_full = \"{1}\"".format(set_string,user_properties['username_full'])
+                    for p in [(user_properties[k],) for k in ad_properties]:
+                        update_data += p
+                    # update the entry
+                    c.execute(update_query, update_data)    
+            except:
+                continue
     columns.extend(ad_properties)
     all_hashes_query = 'SELECT username_full,password,LENGTH(password) as plen,nt_hash,only_lm_cracked,'+ ",".join(ad_properties) + ' \
         FROM hash_infos WHERE history_index = -1 ORDER BY plen DESC, password'
@@ -520,7 +524,7 @@ for group in compare_groups:
             new_tuple += ("No",)
         headers = ["Username", "NT Hash", "Users Sharing this Hash",
                "Share Count", "Password", "Non-Blank LM Hash?"]
-        if args.pullFromAD:
+        if args.pullFromAD or extended_file_properties:
             c.execute(
                 "SELECT "+ ",".join(ad_properties) +" FROM hash_infos WHERE username_full = \"" + tuple[0] + "\" AND history_index = -1 LIMIT 1")
             result = c.fetchone()
@@ -534,7 +538,7 @@ for group in compare_groups:
                           group[0], "<a href=\"" + filename + "\">Details</a>"))
     headers = ["Username of \"" + group[0] + "\" Member",
                "Password Length", "Password", "Only LM Cracked"]
-    if args.pullFromAD:
+    if args.pullFromAD or extended_file_properties:
         headers.extend(ad_properties)
         group_cracked_query = "SELECT username_full, LENGTH(password) as plen, password, only_lm_cracked, \""+ ", ".join(ad_properties) +\
         "\"FROM hash_infos WHERE \"" + group[0] + "\" = 1 and password is not NULL and password is not '' ORDER BY plen"
