@@ -192,6 +192,8 @@ def get_cn_by_samaccountname(samaccountname):
         user_cn = user_cn[0]['CN']
     return user_cn
 
+def bool_to
+
 def get_aduser_properties(username,username_full,properties):
     if not isinstance(properties, list):
         properties = [properties]
@@ -205,13 +207,13 @@ def get_aduser_properties(username,username_full,properties):
         for prop in properties:
             # have to pull these out of UAC settings
             if prop == "Enabled":
-                attr = not user.get_user_account_control_settings()['ACCOUNTDISABLE']
+                attr = not str(user.get_user_account_control_settings()['ACCOUNTDISABLE'])
             elif prop == "PasswordExpired":
-                attr = user.get_user_account_control_settings()['PASSWORD_EXPIRED']
+                attr = str(user.get_user_account_control_settings()['PASSWORD_EXPIRED'])
             elif prop == "PasswordNeverExpires":
-                attr = user.get_user_account_control_settings()['DONT_EXPIRE_PASSWD']
+                attr = str(user.get_user_account_control_settings()['DONT_EXPIRE_PASSWD'])
             elif prop == "PasswordNotRequired":
-                attr = user.get_user_account_control_settings()['PASSWD_NOTREQD']
+                attr = str(user.get_user_account_control_settings()['PASSWD_NOTREQD'])
             else:
                 attr = user.get_attribute(prop)
             attr = attr[0] if isinstance(attr,list) and len(attr) >= 1 else attr
